@@ -25,7 +25,7 @@ from sklearn.metrics import f1_score, accuracy_score
 import torch
 
 from data_pipeline import get_dataloaders
-from model import GraphoVisionCNN
+from model import GraphoVisionResNet
 
 
 # ─────────────────────────────────────────────
@@ -295,7 +295,7 @@ def main():
         print("[ERROR] best_model.pth 없음 — train.py를 먼저 실행하세요")
         return
 
-    model = GraphoVisionCNN().to(DEVICE)
+    model = GraphoVisionResNet().to(DEVICE)
     model.load_state_dict(torch.load(MODEL_PTH, map_location=DEVICE))
     print(f"모델 로드 완료: {MODEL_PTH}")
 

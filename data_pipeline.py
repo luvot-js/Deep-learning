@@ -189,7 +189,8 @@ class HandwritingDataset(Dataset):
         if augment:
             self.transform = transforms.Compose([
                 transforms.RandomCrop(self.CROP_SIZE),
-                transforms.RandomHorizontalFlip(p=0.3),
+                transforms.RandomAffine(degrees=3, translate=(0.02, 0.02)),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.5], std=[0.5]),
             ])

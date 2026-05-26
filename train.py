@@ -23,7 +23,7 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from data_pipeline import get_dataloaders
-from model import GraphoVisionCNN
+from model import GraphoVisionResNet
 
 
 # ─────────────────────────────────────────────
@@ -35,12 +35,14 @@ LINES_DIR  = str(BASE / "lines")
 XML_DIR    = str(BASE / "xml")
 LABEL_TXT  = str(BASE / "label_list.txt")
 
-BATCH_SIZE = 32
-EPOCHS     = 50
-LR         = 1e-3
-DROPOUT    = 0.3
-PATIENCE   = 10          # Early stopping patience
-DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
+BATCH_SIZE    = 32
+EPOCHS        = 50
+LR_HEAD       = 1e-3     # 1단계: fc head만 학습할 때
+LR_FINETUNE   = 1e-4     # 2단계: 전체 fine-tuning
+FREEZE_EPOCHS = 5        # 백본을 고정하고 head만 학습하는 epoch 수
+DROPOUT       = 0.3
+PATIENCE      = 10       # Early stopping patience
+DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 # ─────────────────────────────────────────────
@@ -127,18 +129,19 @@ def main():
         LINES_DIR, XML_DIR, LABEL_TXT, batch_size=BATCH_SIZE
     )
 
-    # 모델
-    model = GraphoVisionCNN(dropout=DROPOUT).to(DEVICE)
+    # ── 1단계: 백본 고정, fc head만 학습 ──────────────────────────
+    print(f"\n[1단계] 백본 고정 — fc head만 학습 ({FREEZE_EPOCHS} epoch)")
+    model = GraphoVisionResNet(dropout=DROPOUT, freeze_backbone=True).to(DEVICE)
 
-    # Loss: pos_weight로 클래스 불균형 보정
     pos_weight = compute_pos_weight(train_loader, DEVICE)
     criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    # Optimizer & Scheduler
-    optimizer = Adam(model.parameters(), lr=LR, weight_decay=1e-4)
+    optimizer = Adam(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=LR_HEAD, weight_decay=1e-4,
+    )
     scheduler = ReduceLROnPlateau(optimizer, mode="min", patience=5, factor=0.5, verbose=True)
 
-    # 학습 히스토리
     history = {
         "train_loss": [],
         "val_loss":   [],
@@ -146,13 +149,25 @@ def main():
         "per_label_acc": [],
     }
 
-    best_val_loss = float("inf")
+    best_val_loss    = float("inf")
     patience_counter = 0
 
-    print(f"\n{'Epoch':>6} | {'Train Loss':>10} | {'Val Loss':>10} | {'Val Acc':>8} | {'Time':>6}")
-    print("-" * 55)
+    print(f"\n{'Epoch':>6} | {'Train Loss':>10} | {'Val Loss':>10} | {'Val Acc':>8} | {'Time':>6} | Phase")
+    print("-" * 68)
 
     for epoch in range(1, EPOCHS + 1):
+
+        # ── 2단계 전환: FREEZE_EPOCHS 이후 전체 파라미터 학습 ──────
+        if epoch == FREEZE_EPOCHS + 1:
+            print(f"\n[2단계] 백본 고정 해제 — 전체 fine-tuning (lr={LR_FINETUNE})")
+            for param in model.parameters():
+                param.requires_grad = True
+            optimizer = Adam(model.parameters(), lr=LR_FINETUNE, weight_decay=1e-4)
+            scheduler = ReduceLROnPlateau(optimizer, mode="min", patience=5, factor=0.5, verbose=True)
+            print(f"\n{'Epoch':>6} | {'Train Loss':>10} | {'Val Loss':>10} | {'Val Acc':>8} | {'Time':>6} | Phase")
+            print("-" * 68)
+
+        phase = "freeze" if epoch <= FREEZE_EPOCHS else "finetune"
         t0 = time.time()
 
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, DEVICE)
@@ -166,7 +181,7 @@ def main():
         history["val_acc"].append(float(val_acc))
         history["per_label_acc"].append(per_label_acc.tolist())
 
-        print(f"{epoch:>6} | {train_loss:>10.4f} | {val_loss:>10.4f} | {val_acc:>8.4f} | {elapsed:>5.1f}s")
+        print(f"{epoch:>6} | {train_loss:>10.4f} | {val_loss:>10.4f} | {val_acc:>8.4f} | {elapsed:>5.1f}s | {phase}")
 
         # Best model 저장
         if val_loss < best_val_loss:
