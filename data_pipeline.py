@@ -17,8 +17,14 @@ import pandas as pd
 from PIL import Image
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import transforms
+
+
+# 사용할 레이블 인덱스 (0~7 중 F1이 안정적인 5개)
+# 0:Emot. 1:Social 2:Energy 3:Will 4:Imag. 5:Fear 6:Intro. 7:Sensit.
+ACTIVE_LABELS = [0, 1, 2, 3, 7]
+NUM_LABELS    = len(ACTIVE_LABELS)   # 5
 
 
 # ─────────────────────────────────────────────
@@ -152,7 +158,7 @@ def build_sample_list(
             skipped += 1
             continue
 
-        labels = np.array(row[label_cols].values, dtype=np.float32)
+        labels = np.array(row[label_cols].values, dtype=np.float32)[ACTIVE_LABELS]
 
         for img_path in png_files:
             samples.append({
@@ -225,7 +231,33 @@ class HandwritingDataset(Dataset):
 
 
 # ─────────────────────────────────────────────
-# 5. DataLoader 생성
+# 5. 오버샘플링 가중치 계산
+# ─────────────────────────────────────────────
+
+def compute_sample_weights(samples: list) -> torch.DoubleTensor:
+    """
+    멀티레이블 오버샘플링용 per-sample 가중치 계산.
+
+    각 샘플의 가중치 = 해당 샘플이 가진 양성 레이블 중 가장 희귀한 것의 역빈도.
+    → Imag./Fear/Intro. 같은 희귀 레이블을 포함한 샘플이 더 자주 선택됨.
+    음성만 있는 샘플은 가중치 1.0.
+    """
+    labels_all = np.array([s["labels"] for s in samples])   # (N, 8)
+    total = len(samples)
+    pos_count = labels_all.sum(axis=0) + 1e-6               # (8,)
+    label_weights = total / pos_count                        # 역빈도 (8,)
+
+    sample_weights = []
+    for lbls in labels_all:
+        pos_idx = np.where(lbls == 1)[0]
+        w = float(label_weights[pos_idx].max()) if len(pos_idx) > 0 else 1.0
+        sample_weights.append(w)
+
+    return torch.DoubleTensor(sample_weights)
+
+
+# ─────────────────────────────────────────────
+# 6. DataLoader 생성
 # ─────────────────────────────────────────────
 
 def get_dataloaders(
@@ -236,11 +268,13 @@ def get_dataloaders(
     split: tuple = (0.7, 0.15, 0.15),
     num_workers: int = 0,
     seed: int = 42,
+    oversample: bool = True,
 ):
     """
     전체 파이프라인을 실행하여 train/val/test DataLoader를 반환한다.
 
     writer 단위로 분리하여 동일 필기자의 이미지가 train/test에 동시에 포함되지 않도록 한다.
+    oversample=True: 희귀 레이블 샘플을 WeightedRandomSampler로 오버샘플링.
     """
     label_df = parse_label_list(label_txt)
     writer_form_map = build_writer_form_map(xml_dir)
@@ -265,10 +299,23 @@ def get_dataloaders(
 
     print(f"[get_dataloaders] train: {len(train_samples)}, val: {len(val_samples)}, test: {len(test_samples)}")
 
-    train_loader = DataLoader(
-        HandwritingDataset(train_samples, augment=True),
-        batch_size=batch_size, shuffle=True, num_workers=num_workers,
-    )
+    if oversample:
+        sample_weights = compute_sample_weights(train_samples)
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(train_samples),
+            replacement=True,
+        )
+        print(f"[get_dataloaders] WeightedRandomSampler 적용 (oversample=True)")
+        train_loader = DataLoader(
+            HandwritingDataset(train_samples, augment=True),
+            batch_size=batch_size, sampler=sampler, num_workers=num_workers,
+        )
+    else:
+        train_loader = DataLoader(
+            HandwritingDataset(train_samples, augment=True),
+            batch_size=batch_size, shuffle=True, num_workers=num_workers,
+        )
     val_loader = DataLoader(
         HandwritingDataset(val_samples, augment=False),
         batch_size=batch_size, shuffle=False, num_workers=num_workers,

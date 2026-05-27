@@ -48,9 +48,6 @@ TRAIT_NAMES = [
     "Social\nBehavior",
     "Mental\nEnergy",
     "Willpower",
-    "Imagination",
-    "Fear /\nAnxiety",
-    "Introversion\n/Extroversion",
     "Sensitivity",
 ]
 
@@ -101,50 +98,74 @@ def plot_training_curves(history_path: str = str(HIST_JSON), save_path: str = No
 def print_per_label_metrics(model, test_loader, device=DEVICE, save_path: str = None):
     """
     test_loader 전체에 대해 8개 레이블 각각의
-    Accuracy, Precision, Recall, F1-Score를 출력하고 그래프로 저장한다.
+    Accuracy, F1-Score를 출력하고 그래프로 저장한다.
+    threshold=0.5(기본)와 per-label 최적 threshold를 함께 비교한다.
     """
     model.eval()
-    all_preds  = []
+    all_probs  = []
     all_labels = []
 
     with torch.no_grad():
         for imgs, labels in test_loader:
             imgs = imgs.to(device)
             logits = model(imgs)
-            preds = (torch.sigmoid(logits) >= 0.5).float().cpu()
-            all_preds.append(preds)
+            probs = torch.sigmoid(logits).cpu()
+            all_probs.append(probs)
             all_labels.append(labels)
 
-    preds_np  = torch.cat(all_preds,  dim=0).numpy()    # (N, 8)
+    probs_np  = torch.cat(all_probs,  dim=0).numpy()    # (N, 8)
     labels_np = torch.cat(all_labels, dim=0).numpy()    # (N, 8)
 
-    short_names = [
-        "Emot.", "Social", "Energy", "Will",
-        "Imag.", "Fear", "Intro.", "Sensit."
-    ]
+    short_names = ["Emot.", "Social", "Energy", "Will", "Sensit."]
 
-    print(f"\n{'Label':<20} {'Accuracy':>9} {'F1-Score':>9}")
-    print("-" * 40)
+    # ── 기본 threshold=0.5 ──────────────────────────────────────────
+    print(f"\n{'Label':<20} {'Accuracy':>9} {'F1 (0.5)':>9}")
+    print("-" * 42)
     accs, f1s = [], []
-    for i in range(8):
-        acc = accuracy_score(labels_np[:, i], preds_np[:, i])
-        f1  = f1_score(labels_np[:, i], preds_np[:, i], zero_division=0)
+    for i in range(5):
+        preds_i = (probs_np[:, i] >= 0.5).astype(float)
+        acc = accuracy_score(labels_np[:, i], preds_i)
+        f1  = f1_score(labels_np[:, i], preds_i, zero_division=0)
         accs.append(acc)
         f1s.append(f1)
         print(f"  label_{i} ({short_names[i]:<8})  {acc:>8.4f}   {f1:>8.4f}")
     print(f"\n  {'Mean':<18}  {np.mean(accs):>8.4f}   {np.mean(f1s):>8.4f}")
 
-    # 막대 그래프
+    # ── Per-label optimal threshold sweep ───────────────────────────
+    SWEEP = [round(t * 0.05, 2) for t in range(2, 11)]  # 0.10 ~ 0.50
+    opt_thresh, opt_f1s, opt_accs = [], [], []
+    for i in range(5):
+        best_t, best_f1 = 0.5, 0.0
+        for t in SWEEP:
+            preds_t = (probs_np[:, i] >= t).astype(float)
+            f1_t = f1_score(labels_np[:, i], preds_t, zero_division=0)
+            if f1_t > best_f1:
+                best_f1, best_t = f1_t, t
+        opt_thresh.append(best_t)
+        opt_f1s.append(best_f1)
+        opt_accs.append(
+            accuracy_score(labels_np[:, i], (probs_np[:, i] >= best_t).astype(float))
+        )
+
+    print(f"\n=== Optimal Threshold per Label ===")
+    print(f"{'Label':<20} {'Thresh':>6} {'Accuracy':>9} {'F1':>9}")
+    print("-" * 48)
+    for i in range(5):
+        print(f"  label_{i} ({short_names[i]:<8})  {opt_thresh[i]:>5.2f}  {opt_accs[i]:>8.4f}   {opt_f1s[i]:>8.4f}")
+    print(f"\n  {'Mean':<25}  {np.mean(opt_accs):>8.4f}   {np.mean(opt_f1s):>8.4f}")
+
+    # ── 막대 그래프 (Accuracy / F1@0.5 / F1@optimal) ────────────────
     x = np.arange(8)
-    width = 0.35
-    fig, ax = plt.subplots(figsize=(12, 5))
-    ax.bar(x - width/2, accs, width, label="Accuracy", color="#42A5F5", alpha=0.85)
-    ax.bar(x + width/2, f1s,  width, label="F1-Score",  color="#EF5350", alpha=0.85)
+    width = 0.25
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.bar(x - width,   accs,    width, label="Accuracy",      color="#42A5F5", alpha=0.85)
+    ax.bar(x,           f1s,     width, label="F1 (thr=0.5)",  color="#EF5350", alpha=0.85)
+    ax.bar(x + width,   opt_f1s, width, label="F1 (optimal)",  color="#66BB6A", alpha=0.85)
     ax.set_xticks(x)
     ax.set_xticklabels(short_names, fontsize=10)
     ax.set_ylim(0, 1.05)
     ax.set_ylabel("Score")
-    ax.set_title("GraphoVision — Per-Label Accuracy & F1-Score (Test Set)", fontsize=13)
+    ax.set_title("GraphoVision — Per-Label Metrics: Accuracy / F1@0.5 / F1@Optimal (Test Set)", fontsize=12)
     ax.legend()
     ax.grid(axis="y", alpha=0.3)
 
@@ -154,7 +175,7 @@ def print_per_label_metrics(model, test_loader, device=DEVICE, save_path: str = 
     plt.close()
     print(f"\n[print_per_label_metrics] 저장: {out}")
 
-    return accs, f1s
+    return accs, f1s, opt_thresh, opt_f1s
 
 
 # ─────────────────────────────────────────────

@@ -19,6 +19,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
@@ -39,7 +40,7 @@ BATCH_SIZE    = 32
 EPOCHS        = 50
 LR_HEAD       = 1e-3     # 1단계: fc head만 학습할 때
 LR_FINETUNE   = 1e-4     # 2단계: 전체 fine-tuning
-FREEZE_EPOCHS = 5        # 백본을 고정하고 head만 학습하는 epoch 수
+FREEZE_EPOCHS = 10       # 백본을 고정하고 head만 학습하는 epoch 수
 DROPOUT       = 0.3
 PATIENCE      = 10       # Early stopping patience
 DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
@@ -67,9 +68,10 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
     return total_loss / len(loader.dataset)
 
 
-def evaluate(model, loader, criterion, device):
+def evaluate(model, loader, criterion, device, threshold: float = 0.5):
     """
     val/test 루프. loss와 레이블별 accuracy를 반환한다.
+    threshold: sigmoid 출력을 양성으로 판단하는 기준값 (기본 0.5)
     """
     model.eval()
     total_loss = 0.0
@@ -83,7 +85,7 @@ def evaluate(model, loader, criterion, device):
             loss = criterion(logits, labels)
             total_loss += loss.item() * imgs.size(0)
 
-            preds = (torch.sigmoid(logits) >= 0.5).float()
+            preds = (torch.sigmoid(logits) >= threshold).float()
             all_preds.append(preds.cpu())
             all_labels.append(labels.cpu())
 
@@ -98,23 +100,53 @@ def evaluate(model, loader, criterion, device):
 
 
 # ─────────────────────────────────────────────
-# 클래스 불균형 대응: pos_weight 계산
+# 클래스 불균형 대응: Focal Loss
 # ─────────────────────────────────────────────
 
-def compute_pos_weight(train_loader, device):
+class FocalLoss(nn.Module):
     """
-    BCEWithLogitsLoss의 pos_weight 계산.
-    양성(1) 비율이 낮은 레이블에 더 높은 가중치를 부여한다.
+    멀티레이블 이진 분류용 Focal Loss.
+
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+    alpha : (num_labels,) 레이블별 양성 클래스 가중치
+            = neg_count / total  → 양성이 희귀할수록 높은 값
+    gamma : focusing 파라미터. 클수록 easy example 억제 효과 강함 (기본 2.0)
+    """
+    def __init__(self, alpha: torch.Tensor, gamma: float = 2.0):
+        super().__init__()
+        self.register_buffer("alpha", alpha)
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # logits, targets: (N, L)
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        p_t = torch.exp(-bce)                                          # sigmoid(logit)*y + (1-sigmoid)*( 1-y)
+        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        loss = alpha_t * (1 - p_t) ** self.gamma * bce
+        return loss.mean()
+
+
+def compute_alpha(train_loader, device, min_a: float = 0.5, max_a: float = 0.99):
+    """
+    Focal Loss의 per-label alpha 계산.
+    alpha = neg_count / total  (양성이 드물수록 alpha 높음 → 양성에 집중)
+
+    클램핑 범위 [min_a, max_a]:
+      - 하한(0.5): alpha < 0.5면 음성이 더 희귀한 상황 — 그냥 0.5로 유지
+      - 상한(0.99): 극단적 불균형에서도 수치 안정성 유지
     """
     all_labels = []
     for _, labels in train_loader:
         all_labels.append(labels)
-    all_labels = torch.cat(all_labels, dim=0)   # (N, 8)
+    all_labels = torch.cat(all_labels, dim=0)       # (N, L)
 
-    pos_count = all_labels.sum(dim=0)           # (8,)
-    neg_count = all_labels.size(0) - pos_count
-    pos_weight = neg_count / (pos_count + 1e-6)
-    return pos_weight.to(device)
+    total     = all_labels.size(0)
+    pos_count = all_labels.sum(dim=0)               # (L,)
+    alpha     = (total - pos_count) / total         # neg_rate per label
+    alpha     = alpha.clamp(min=min_a, max=max_a)
+    print(f"Focal alpha (clamped to [{min_a}, {max_a}]): {alpha.tolist()}")
+    return alpha.to(device)
 
 
 # ─────────────────────────────────────────────
@@ -131,16 +163,16 @@ def main():
 
     # ── 1단계: 백본 고정, fc head만 학습 ──────────────────────────
     print(f"\n[1단계] 백본 고정 — fc head만 학습 ({FREEZE_EPOCHS} epoch)")
-    model = GraphoVisionResNet(dropout=DROPOUT, freeze_backbone=True).to(DEVICE)
+    model = GraphoVisionResNet(num_labels=5, dropout=DROPOUT, freeze_backbone=True).to(DEVICE)
 
-    pos_weight = compute_pos_weight(train_loader, DEVICE)
-    criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    alpha     = compute_alpha(train_loader, DEVICE)
+    criterion = FocalLoss(alpha=alpha, gamma=2.0)
 
     optimizer = Adam(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=LR_HEAD, weight_decay=1e-4,
     )
-    scheduler = ReduceLROnPlateau(optimizer, mode="min", patience=5, factor=0.5, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", patience=5, factor=0.5)
 
     history = {
         "train_loss": [],
@@ -163,7 +195,7 @@ def main():
             for param in model.parameters():
                 param.requires_grad = True
             optimizer = Adam(model.parameters(), lr=LR_FINETUNE, weight_decay=1e-4)
-            scheduler = ReduceLROnPlateau(optimizer, mode="min", patience=5, factor=0.5, verbose=True)
+            scheduler = ReduceLROnPlateau(optimizer, mode="min", patience=5, factor=0.5)
             print(f"\n{'Epoch':>6} | {'Train Loss':>10} | {'Val Loss':>10} | {'Val Acc':>8} | {'Time':>6} | Phase")
             print("-" * 68)
 
